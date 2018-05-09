@@ -1070,6 +1070,11 @@ bool static AlreadyHave(const CInv& inv) EXCLUSIVE_LOCKS_REQUIRED(cs_main)
     case MSG_BLOCK:
     case MSG_WITNESS_BLOCK:
         return LookupBlockIndex(inv.hash) != nullptr;
+    case MSG_DANDELION_TX:
+    case MSG_DANDELION_WITNESS_TX:
+        // Do not use AlreadyHave for Dandelion transactions
+        // If accidentally used, returns false so tx is requested
+        return false;
     }
     // Don't know what it is, just say we already got one
     return true;
@@ -1082,6 +1087,52 @@ static void RelayTransaction(const CTransaction& tx, CConnman* connman)
     {
         pnode->PushInventory(inv);
     });
+}
+
+static void RelayDandelionTransaction(const CTransaction& tx, CConnman* connman, CNode* pfrom)
+{
+    FastRandomContext rng;
+    if (rng.randrange(100)<DANDELION_FLUFF) {
+        LogPrint(BCLog::DANDELION, "Dandelion fluff: %s\n", tx.GetHash().ToString());
+        CValidationState state;
+        CTransactionRef ptx = stempool.get(tx.GetHash());
+        bool fMissingInputs = false;
+        std::list<CTransactionRef> lRemovedTxn;
+        AcceptToMemoryPool(mempool, state, ptx, &fMissingInputs, &lRemovedTxn, false /* bypass_limits */, 0 /* nAbsurdFee */);
+        LogPrint(BCLog::MEMPOOL, "AcceptToMemoryPool: peer=%d: accepted %s (poolsz %u txn, %u kB)\n",
+                 pfrom->GetId(), tx.GetHash().ToString(), mempool.size(), mempool.DynamicMemoryUsage() / 1000);
+        RelayTransaction(tx, connman);
+    } else {
+        CInv inv(MSG_DANDELION_TX, tx.GetHash());
+        CNode* destination = connman->getDandelionDestination(pfrom);
+        if (destination!=nullptr) {
+            destination->PushInventory(inv);
+        }
+    }
+}
+
+static void CheckDandelionEmbargoes(CConnman* connman)
+{
+    int64_t nCurrTime = GetTimeMicros();
+    for (auto iter=connman->mDandelionEmbargo.begin(); iter!=connman->mDandelionEmbargo.end();) {
+        if (mempool.exists(iter->first)) {
+            LogPrint(BCLog::DANDELION, "Embargoed dandeliontx %s found in mempool; removing from embargo map\n", iter->first.ToString());
+            iter = connman->mDandelionEmbargo.erase(iter);
+        } else if (iter->second < nCurrTime) {
+            LogPrint(BCLog::DANDELION, "dandeliontx %s embargo expired\n", iter->first.ToString());
+            CValidationState state;
+            CTransactionRef ptx = stempool.get(iter->first);
+            bool fMissingInputs = false;
+            std::list<CTransactionRef> lRemovedTxn;
+            AcceptToMemoryPool(mempool, state, ptx, &fMissingInputs, &lRemovedTxn, false /* bypass_limits */, 0 /* nAbsurdFee */);
+            LogPrint(BCLog::MEMPOOL, "AcceptToMemoryPool: accepted %s (poolsz %u txn, %u kB)\n",
+                     iter->first.ToString(), mempool.size(), mempool.DynamicMemoryUsage() / 1000);
+            RelayTransaction(*ptx, connman);
+            iter = connman->mDandelionEmbargo.erase(iter);
+        } else {
+            iter++;
+        }
+    }
 }
 
 static void RelayAddress(const CAddress& addr, bool fReachable, CConnman* connman)
@@ -1285,7 +1336,8 @@ void static ProcessGetData(CNode* pfrom, const CChainParams& chainparams, CConnm
     {
         LOCK(cs_main);
 
-        while (it != pfrom->vRecvGetData.end() && (it->type == MSG_TX || it->type == MSG_WITNESS_TX)) {
+        while (it != pfrom->vRecvGetData.end() &&
+               (it->type == MSG_TX || it->type == MSG_WITNESS_TX || it->type == MSG_DANDELION_TX || it->type == MSG_DANDELION_WITNESS_TX)) {
             if (interruptMsgProc)
                 return;
             // Don't bother if send buffer is too full to respond anyway
@@ -1297,18 +1349,39 @@ void static ProcessGetData(CNode* pfrom, const CChainParams& chainparams, CConnm
 
             // Send stream from relay memory
             bool push = false;
-            auto mi = mapRelay.find(inv.hash);
-            int nSendFlags = (inv.type == MSG_TX ? SERIALIZE_TRANSACTION_NO_WITNESS : 0);
-            if (mi != mapRelay.end()) {
-                connman->PushMessage(pfrom, msgMaker.Make(nSendFlags, NetMsgType::TX, *mi->second));
-                push = true;
-            } else if (pfrom->timeLastMempoolReq) {
-                auto txinfo = mempool.info(inv.hash);
-                // To protect privacy, do not answer getdata using the mempool when
-                // that TX couldn't have been INVed in reply to a MEMPOOL request.
-                if (txinfo.tx && txinfo.nTime <= pfrom->timeLastMempoolReq) {
-                    connman->PushMessage(pfrom, msgMaker.Make(nSendFlags, NetMsgType::TX, *txinfo.tx));
+            if (inv.type == MSG_DANDELION_TX || inv.type == MSG_DANDELION_WITNESS_TX) {
+                int nSendFlags = (inv.type == MSG_DANDELION_TX ? SERIALIZE_TRANSACTION_NO_WITNESS : 0);
+                auto txinfo = stempool.info(inv.hash);
+                uint256 dandelionServiceDiscoveryHash;
+                dandelionServiceDiscoveryHash.SetHex("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+                if (txinfo.tx && !connman->isDandelionInbound(pfrom) && pfrom->setDandelionInventoryKnown.count(inv.hash)!=0) {
+                    connman->PushMessage(pfrom, msgMaker.Make(nSendFlags, NetMsgType::DANDELIONTX, *txinfo.tx));
                     push = true;
+                } else if (inv.hash==dandelionServiceDiscoveryHash && pfrom->setDandelionInventoryKnown.count(inv.hash)!=0) {
+                    LogPrint(BCLog::DANDELION, "Peer %d supports Dandelion\n", pfrom->GetId());
+                    pfrom->fSupportsDandelion = true;
+                    push = true;
+                }
+            } else if(inv.type == MSG_TX || inv.type == MSG_WITNESS_TX) {
+                auto mi = mapRelay.find(inv.hash);
+                int nSendFlags = (inv.type == MSG_TX ? SERIALIZE_TRANSACTION_NO_WITNESS : 0);
+                if (!pfrom->fSupportsDandelion && !connman->isDandelionInbound(pfrom) && pfrom->setDandelionInventoryKnown.count(inv.hash)!=0) {
+                    auto txinfo = stempool.info(inv.hash);
+                    if (txinfo.tx) {
+                        connman->PushMessage(pfrom, msgMaker.Make(nSendFlags, NetMsgType::TX, *txinfo.tx));
+                        push = true;
+                    }
+                } else if (mi != mapRelay.end()) {
+                    connman->PushMessage(pfrom, msgMaker.Make(nSendFlags, NetMsgType::TX, *mi->second));
+                    push = true;
+                } else if (pfrom->timeLastMempoolReq) {
+                    auto txinfo = mempool.info(inv.hash);
+                    // To protect privacy, do not answer getdata using the mempool when
+                    // that TX couldn't have been INVed in reply to a MEMPOOL request.
+                    if (txinfo.tx && txinfo.nTime <= pfrom->timeLastMempoolReq) {
+                        connman->PushMessage(pfrom, msgMaker.Make(nSendFlags, NetMsgType::TX, *txinfo.tx));
+                        push = true;
+                    }
                 }
             }
             if (!push) {
@@ -1668,6 +1741,8 @@ bool static ProcessMessage(CNode* pfrom, const std::string& strCommand, CDataStr
             return false;
         }
     }
+
+    CheckDandelionEmbargoes(connman);
 
     if (strCommand == NetMsgType::REJECT)
     {
@@ -2031,7 +2106,7 @@ bool static ProcessMessage(CNode* pfrom, const std::string& strCommand, CDataStr
             bool fAlreadyHave = AlreadyHave(inv);
             LogPrint(BCLog::NET, "got inv: %s  %s peer=%d\n", inv.ToString(), fAlreadyHave ? "have" : "new", pfrom->GetId());
 
-            if (inv.type == MSG_TX) {
+            if (inv.type == MSG_TX || inv.type == MSG_DANDELION_TX) {
                 inv.type |= nFetchFlags;
             }
 
@@ -2045,6 +2120,18 @@ bool static ProcessMessage(CNode* pfrom, const std::string& strCommand, CDataStr
                     // then ask for the blocks we need.
                     connman->PushMessage(pfrom, msgMaker.Make(NetMsgType::GETHEADERS, chainActive.GetLocator(pindexBestHeader), inv.hash));
                     LogPrint(BCLog::NET, "getheaders (%d) %s to peer=%d\n", pindexBestHeader->nHeight, inv.hash.ToString(), pfrom->GetId());
+                }
+            }
+            else if (inv.type == MSG_DANDELION_TX) {
+                auto result = pfrom->setDandelionInventoryKnown.insert(inv.hash);
+                fAlreadyHave = !result.second;
+                uint256 dandelionServiceDiscoveryHash;
+                dandelionServiceDiscoveryHash.SetHex("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+                if (fBlocksOnly) {
+                    LogPrint(BCLog::NET, "transaction (%s) inv sent in violation of protocol peer=%d\n", inv.hash.ToString(), pfrom->GetId());
+                } else if ((!fAlreadyHave && !fImporting && !fReindex && !IsInitialBlockDownload() && connman->isDandelionInbound(pfrom)) ||
+                           (inv.hash==dandelionServiceDiscoveryHash)) {
+                    pfrom->AskFor(inv);
                 }
             }
             else
@@ -2274,6 +2361,8 @@ bool static ProcessMessage(CNode* pfrom, const std::string& strCommand, CDataStr
             return true;
         }
 
+        std::deque<COutPoint> vWorkQueue;
+        std::vector<uint256> vEraseQueue;
         CTransactionRef ptx;
         vRecv >> ptx;
         const CTransaction& tx = *ptx;
@@ -2285,6 +2374,7 @@ bool static ProcessMessage(CNode* pfrom, const std::string& strCommand, CDataStr
 
         bool fMissingInputs = false;
         CValidationState state;
+        CValidationState dummyState; // Dummy state for Dandelion stempool
 
         pfrom->setAskFor.erase(inv.hash);
         mapAlreadyAskedFor.erase(inv.hash);
@@ -2293,7 +2383,15 @@ bool static ProcessMessage(CNode* pfrom, const std::string& strCommand, CDataStr
 
         if (!AlreadyHave(inv) &&
             AcceptToMemoryPool(mempool, state, ptx, &fMissingInputs, &lRemovedTxn, false /* bypass_limits */, 0 /* nAbsurdFee */)) {
+            // Changes to mempool should also be made to Dandelion stempool
+            AcceptToMemoryPool(stempool, dummyState, ptx, nullptr, nullptr, false, 0);
+            if (connman->isTxDandelionEmbargoed(tx.GetHash())) {
+                LogPrint(BCLog::DANDELION, "Embargoed dandeliontx %s found in mempool; removing from embargo map\n", tx.GetHash().ToString());
+                connman->removeDandelionEmbargo(tx.GetHash());
+            }
             mempool.check(pcoinsTip.get());
+            // Changes to mempool should also be made to Dandelion stempool
+            stempool.check(pcoinsTip.get());
             RelayTransaction(tx, connman);
             for (unsigned int i = 0; i < tx.vout.size(); i++) {
                 auto it_by_prev = mapOrphanTransactionsByPrev.find(COutPoint(inv.hash, i));
@@ -2312,7 +2410,70 @@ bool static ProcessMessage(CNode* pfrom, const std::string& strCommand, CDataStr
                 mempool.size(), mempool.DynamicMemoryUsage() / 1000);
 
             // Recursively process any orphan transactions that depended on this one
-            ProcessOrphanTx(connman, pfrom->orphan_work_set, lRemovedTxn);
+            std::set<NodeId> setMisbehaving;
+            while (!vWorkQueue.empty()) {
+                auto itByPrev = mapOrphanTransactionsByPrev.find(vWorkQueue.front());
+                vWorkQueue.pop_front();
+                if (itByPrev == mapOrphanTransactionsByPrev.end())
+                    continue;
+                for (auto mi = itByPrev->second.begin();
+                     mi != itByPrev->second.end();
+                     ++mi)
+                {
+                    const CTransactionRef& porphanTx = (*mi)->second.tx;
+                    const CTransaction& orphanTx = *porphanTx;
+                    const uint256& orphanHash = orphanTx.GetHash();
+                    NodeId fromPeer = (*mi)->second.fromPeer;
+                    bool fMissingInputs2 = false;
+                    // Use a dummy CValidationState so someone can't setup nodes to counter-DoS based on orphan
+                    // resolution (that is, feeding people an invalid transaction based on LegitTxX in order to get
+                    // anyone relaying LegitTxX banned)
+                    CValidationState stateDummy;
+                    CValidationState stateDummyDandelion;
+
+
+                    if (setMisbehaving.count(fromPeer))
+                        continue;
+                    if (AcceptToMemoryPool(mempool, stateDummy, porphanTx, &fMissingInputs2, &lRemovedTxn, false /* bypass_limits */, 0 /* nAbsurdFee */)) {
+                        // Changes to mempool should also be made to Dandelion stempool
+                        AcceptToMemoryPool(stempool, stateDummyDandelion, porphanTx, nullptr, nullptr, false, 0);
+                        LogPrint(BCLog::MEMPOOL, "   accepted orphan tx %s\n", orphanHash.ToString());
+                        RelayTransaction(orphanTx, connman);
+                        for (unsigned int i = 0; i < orphanTx.vout.size(); i++) {
+                            vWorkQueue.emplace_back(orphanHash, i);
+                        }
+                        vEraseQueue.push_back(orphanHash);
+                    }
+                    else if (!fMissingInputs2)
+                    {
+                        int nDos = 0;
+                        if (stateDummy.IsInvalid(nDos) && nDos > 0)
+                        {
+                            // Punish peer that gave us an invalid orphan tx
+                            Misbehaving(fromPeer, nDos);
+                            setMisbehaving.insert(fromPeer);
+                            LogPrint(BCLog::MEMPOOL, "   invalid orphan tx %s\n", orphanHash.ToString());
+                        }
+                        // Has inputs but not accepted to mempool
+                        // Probably non-standard or insufficient fee
+                        LogPrint(BCLog::MEMPOOL, "   removed orphan tx %s\n", orphanHash.ToString());
+                        vEraseQueue.push_back(orphanHash);
+                        if (!orphanTx.HasWitness() && !stateDummy.CorruptionPossible()) {
+                            // Do not use rejection cache for witness transactions or
+                            // witness-stripped transactions, as they can have been malleated.
+                            // See https://github.com/bitcoin/bitcoin/issues/8279 for details.
+                            assert(recentRejects);
+                            recentRejects->insert(orphanHash);
+                        }
+                    }
+                    mempool.check(pcoinsTip.get());
+                    // Changes to mempool should also be made to Dandelion stempool
+                    stempool.check(pcoinsTip.get());
+                }
+            }
+
+            for (uint256 hash : vEraseQueue)
+                EraseOrphanTx(hash);
         }
         else if (fMissingInputs)
         {
@@ -2414,7 +2575,47 @@ bool static ProcessMessage(CNode* pfrom, const std::string& strCommand, CDataStr
         return true;
     }
 
-    if (strCommand == NetMsgType::CMPCTBLOCK && !fImporting && !fReindex) // Ignore blocks received while importing
+    else if (strCommand == NetMsgType::DANDELIONTX)
+    {
+        CValidationState state;
+        CTransactionRef ptx;
+        vRecv >> ptx;
+        const CTransaction& tx = *ptx;
+        bool fMissingInputs = false;
+        std::list<CTransactionRef> lRemovedTxn;
+        CInv inv(MSG_DANDELION_TX, tx.GetHash());
+        LOCK(cs_main);
+        if (connman->isDandelionInbound(pfrom)) {
+            if (!stempool.exists(inv.hash)) {
+                bool ret = AcceptToMemoryPool(stempool, state, ptx, &fMissingInputs, &lRemovedTxn, false /* bypass_limits */, 0 /* nAbsurdFee */);
+                if (ret) {
+                    LogPrint(BCLog::MEMPOOL, "AcceptToStemPool: peer=%d: accepted %s (poolsz %u txn, %u kB)\n",
+                             pfrom->GetId(), tx.GetHash().ToString(), stempool.size(), stempool.DynamicMemoryUsage() / 1000);
+                    int64_t nCurrTime = GetTimeMicros();
+                    int64_t nEmbargo = 1000000*DANDELION_EMBARGO_MINIMUM+PoissonNextSend(nCurrTime, DANDELION_EMBARGO_AVG_ADD);
+                    connman->insertDandelionEmbargo(tx.GetHash(),nEmbargo);
+                    LogPrint(BCLog::DANDELION, "dandeliontx %s embargoed for %d seconds\n", tx.GetHash().ToString(), (nEmbargo-nCurrTime)/1000000);
+                }
+                int nDoS = 0;
+                if (state.IsInvalid(nDoS)) {
+                    LogPrint(BCLog::MEMPOOLREJ, "%s from peer=%d was not accepted: %s\n", tx.GetHash().ToString(),
+                             pfrom->GetId(), FormatStateMessage(state));
+                    if (state.GetRejectCode() > 0 && state.GetRejectCode() < REJECT_INTERNAL) { // Never send AcceptToMemoryPool's internal codes over P2P
+                        connman->PushMessage(pfrom, msgMaker.Make(NetMsgType::REJECT, strCommand, (unsigned char)state.GetRejectCode(),
+                                             state.GetRejectReason().substr(0, MAX_REJECT_MESSAGE_LENGTH), inv.hash));
+                    }
+                    if (nDoS > 0) {
+                        Misbehaving(pfrom->GetId(), nDoS);
+                    }
+                }
+            }
+            if (stempool.exists(inv.hash)) {
+                RelayDandelionTransaction(tx, connman, pfrom);
+            }
+        }
+    }
+
+    else if (strCommand == NetMsgType::CMPCTBLOCK && !fImporting && !fReindex) // Ignore blocks received while importing
     {
         CBlockHeaderAndShortTxIDs cmpctblock;
         vRecv >> cmpctblock;
@@ -3563,6 +3764,23 @@ bool PeerLogicValidation::SendMessages(CNode* pto)
                 }
             }
             pto->vInventoryBlockToSend.clear();
+
+            // Add Dandelion transactions
+            for (const uint256& hash : pto->vInventoryDandelionTxToSend) {
+                pto->setDandelionInventoryKnown.insert(hash);
+                uint256 dandelionServiceDiscoveryHash;
+                dandelionServiceDiscoveryHash.SetHex("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+                if (!pto->fSupportsDandelion && hash!=dandelionServiceDiscoveryHash) {
+                    vInv.push_back(CInv(MSG_TX, hash));
+                } else {
+                    vInv.push_back(CInv(MSG_DANDELION_TX, hash));
+                }
+                if (vInv.size() == MAX_INV_SZ) {
+                    connman->PushMessage(pto, msgMaker.Make(NetMsgType::INV, vInv));
+                    vInv.clear();
+                }
+            }
+            pto->vInventoryDandelionTxToSend.clear();
 
             // Check whether periodic sends should happen
             bool fSendTrickle = pto->fWhitelisted;

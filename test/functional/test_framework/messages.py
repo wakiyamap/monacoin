@@ -229,7 +229,9 @@ class CInv:
         2: "Block",
         1|MSG_WITNESS_FLAG: "WitnessTx",
         2|MSG_WITNESS_FLAG : "WitnessBlock",
-        4: "CompactBlock"
+        4: "CompactBlock",
+        5: "DandelionTx",
+        5|MSG_WITNESS_FLAG: "DandelionWitnessTx"
     }
 
     def __init__(self, t=0, h=0):
@@ -1236,12 +1238,10 @@ class msg_mempool:
     def __repr__(self):
         return "msg_mempool()"
 
-
-class msg_notfound:
-    __slots__ = ("vec", )
+class msg_notfound():
     command = b"notfound"
 
-    def __init__(self, vec=None):
+    def __init__(self):
         self.vec = vec or []
 
     def deserialize(self, f):
@@ -1253,8 +1253,7 @@ class msg_notfound:
     def __repr__(self):
         return "msg_notfound(vec=%s)" % (repr(self.vec))
 
-
-class msg_sendheaders:
+class msg_sendheaders():
     __slots__ = ()
     command = b"sendheaders"
 
@@ -1415,8 +1414,22 @@ class msg_cmpctblock:
     def __repr__(self):
         return "msg_cmpctblock(HeaderAndShortIDs=%s)" % repr(self.header_and_shortids)
 
+class msg_dandeliontx():
+    command = b"dandeliontx"
 
-class msg_getblocktxn:
+    def __init__(self, tx=CTransaction()):
+        self.tx = tx
+
+    def deserialize(self, f):
+        self.tx.deserialize(f)
+
+    def serialize(self):
+        return self.tx.serialize_without_witness()
+
+    def __repr__(self):
+        return "msg_dandeliontx(tx=%s)" % (repr(self.tx))
+
+class msg_getblocktxn():
     __slots__ = ("block_txn_request",)
     command = b"getblocktxn"
 

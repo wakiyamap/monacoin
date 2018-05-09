@@ -62,6 +62,7 @@ MESSAGEMAP = {
     b"block": msg_block,
     b"blocktxn": msg_blocktxn,
     b"cmpctblock": msg_cmpctblock,
+    b"dandeliontx": msg_dandeliontx,
     b"feefilter": msg_feefilter,
     b"getaddr": msg_getaddr,
     b"getblocks": msg_getblocks,
@@ -322,6 +323,7 @@ class P2PInterface(P2PConnection):
     def on_block(self, message): pass
     def on_blocktxn(self, message): pass
     def on_cmpctblock(self, message): pass
+    def on_dandeliontx(self, message): pass
     def on_feefilter(self, message): pass
     def on_getaddr(self, message): pass
     def on_getblocks(self, message): pass
